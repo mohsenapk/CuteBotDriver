@@ -190,7 +190,6 @@ class MainActivity : ComponentActivity() {
     fun RobotControllerScreen() {
         var driveSpeed by remember { mutableFloatStateOf(60f) }
         var avoidBlocks by remember { mutableStateOf(true) }
-        var thinLine by remember { mutableStateOf(false) }
         val isConnected = activeGatt != null
 
         Column(
@@ -251,12 +250,11 @@ class MainActivity : ComponentActivity() {
             Spacer(modifier = Modifier.height(12.dp))
 
             // Line follower (robot sensors)
-            SectionHeader(title = "Purple Line Follower (robot sensors)")
+            SectionHeader(title = "Purple Road Follower (robot sensors)")
             Button(
                 onClick = {
                     follower.baseSpeed = driveSpeed.toInt()
                     follower.avoidBlocks = avoidBlocks
-                    follower.thinLine = thinLine
                     toggleFollow()
                 },
                 enabled = isConnected,
@@ -273,14 +271,7 @@ class MainActivity : ComponentActivity() {
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Avoid blocks (distance sensor)")
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(
-                    checked = thinLine,
-                    onCheckedChange = { thinLine = it; follower.thinLine = it }
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Thin line (between the two sensors)")
-            }
+            Text("Put the robot in the middle of the road (between the white lines) before pressing Start.", fontSize = 12.sp)
             Text(followStatus)
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -509,22 +500,26 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
- * Line follower that uses the ROBOT's own sensors (no phone camera):
- *  - bottom infrared line sensors (?LINE): 3 = both on line, 2 = left on line, 1 = right on line, 0 = none
- *  - ultrasonic distance sensor (?DIST): used to slow down and turn away from blocks ahead
+ * Road follower using the ROBOT's own sensors (no phone camera).
  *
- * Everything goes through one 50 ms loop that sends exactly one BLE command per tick
- * (a motor command if it changed, otherwise a sensor query), so writes never collide.
+ * The track is a wide purple road with a white line on each side. The two infrared sensors only say
+ * "dark" or "not dark" for left and right. Instead of guessing how purple reads, the app LEARNS it:
+ * when you press Start the robot (standing still in the middle of the road) watches what both
+ * sensors report and treats that as "centered". If only ONE sensor changes (it reached the white
+ * border or the black floor), the robot is drifting toward that side, so it steers away.
+ * The baseline keeps updating whenever both sensors agree for a while, because the road colour
+ * changes from blue to pink along the track.
+ *
+ * The ultrasonic sensor slows the robot down and turns it a bit when something is close ahead.
+ * One BLE command is sent per 50 ms tick, so writes never collide.
  */
 class SensorLineFollower(
     private val gattProvider: () -> BluetoothGatt?,
     private val onStatus: (String) -> Unit = {},
     private val onFinished: () -> Unit = {}
 ) {
-    // ---- Tuning knobs ----
     @Volatile var baseSpeed = 40          // forward speed (motors stall below ~25)
-    @Volatile var avoidBlocks = true      // slow down / turn away from blocks using the distance sensor
-    @Volatile var thinLine = false        // true if the line is thinner than the gap between the two sensors
+    @Volatile var avoidBlocks = true      // slow down / turn away from obstacles ahead
 
     private data class Cmd(val left: Int, val right: Int, val note: String)
 
@@ -533,25 +528,23 @@ class SensorLineFollower(
     private var scheduler: ScheduledExecutorService? = null
     private val handler = Handler(Looper.getMainLooper())
 
-    // Latest sensor values (written by BLE thread, read by the loop)
     @Volatile private var lineCode = -1
     @Volatile private var distanceCm = -1
     @Volatile private var lastReplyMs = 0L
 
-    // Loop state (only touched by the loop thread)
     private var tickCount = 0
     private var queryIndex = 0
-    private var lastSide = 1              // 1 = line last seen on the right, -1 = on the left
-    private var prevCode = -1
-    private var sameSideTicks = 0
-    private var lostTicks = 0
+    private var baseline: Boolean? = null  // true = road reads "dark", false = road reads "bright"
+    private var agreeTicks = 0
+    private var calibTicks = 0
+    private var bothTicks = 0
+    private var lastSteer = 1              // 1 = last steered right, -1 = left
+    private var sideTicks = 0
     private var obstacleActive = false
     private var obstacleTicks = 0
     private var lastCmd: Cmd? = null
     private var lastCmdMs = 0L
-    private var lastDecision = Cmd(0, 0, "")
 
-    /** Call from CutebotController.onTelemetry for every telemetry packet. */
     fun onTelemetry(t: CutebotTelemetry) {
         when (t) {
             is CutebotTelemetry.LineTracker -> {
@@ -571,8 +564,9 @@ class SensorLineFollower(
         lineCode = -1
         distanceCm = -1
         lastReplyMs = System.currentTimeMillis()
-        tickCount = 0; queryIndex = 0; prevCode = -1; sameSideTicks = 0; lostTicks = 0
-        obstacleActive = false; obstacleTicks = 0; lastCmd = null; lastCmdMs = 0L
+        tickCount = 0; queryIndex = 0; baseline = null; agreeTicks = 0; calibTicks = 0
+        bothTicks = 0; sideTicks = 0; obstacleActive = false; obstacleTicks = 0
+        lastCmd = null; lastCmdMs = 0L
         val s = Executors.newSingleThreadScheduledExecutor()
         scheduler = s
         s.scheduleWithFixedDelay({
@@ -582,18 +576,16 @@ class SensorLineFollower(
                 android.util.Log.e("LineFollower", "tick failed", e)
             }
         }, 0, 50, TimeUnit.MILLISECONDS)
-        onStatus("Following: reading sensors")
+        onStatus("Calibrating: keep the robot in the middle of the road")
     }
 
     fun stop() {
-        // Under the lock so the loop can never send a drive command after the stop
         synchronized(lock) {
             running = false
             gattProvider()?.let { CutebotController.stop(it) }
         }
         scheduler?.shutdown()
         scheduler = null
-        // Repeat the stop in case a BLE write was busy and the first one was dropped
         handler.postDelayed({ if (!running) gattProvider()?.let { CutebotController.stop(it) } }, 120)
         handler.postDelayed({ if (!running) gattProvider()?.let { CutebotController.stop(it) } }, 300)
         onStatus("Stopped")
@@ -610,7 +602,6 @@ class SensorLineFollower(
         tickCount++
         val now = System.currentTimeMillis()
 
-        // Watchdog: no sensor reply for 1.5 s (disconnected / robot not answering) -> stop
         if (now - lastReplyMs > 1500) {
             haltItself("No sensor data: stopped")
             return
@@ -622,13 +613,13 @@ class SensorLineFollower(
             return
         }
 
-        val changed = lastCmd == null || cmd.left != lastCmd!!.left || cmd.right != lastCmd!!.right
+        val prev = lastCmd
+        val changed = prev == null || cmd.left != prev.left || cmd.right != prev.right
         if (changed || now - lastCmdMs > 300) {
             send { g -> CutebotController.setMotorSpeeds(g, cmd.left, cmd.right) }
             lastCmd = cmd
             lastCmdMs = now
         } else {
-            // line queries twice for every distance query
             val askDistance = avoidBlocks && (queryIndex % 3 == 2)
             queryIndex++
             send { g ->
@@ -638,70 +629,76 @@ class SensorLineFollower(
         }
 
         if (tickCount % 5 == 0) {
-            onStatus("line=$lineCode  dist=${distanceCm}cm  ${cmd.note}")
+            val b = baseline
+            val bs = if (b == null) "?" else if (b) "dark" else "bright"
+            onStatus("line=$lineCode road=$bs dist=${distanceCm}cm  ${cmd.note}")
         }
     }
 
     private fun decide(): Cmd {
-        val d = distanceCm
         val code = lineCode
+        if (code < 0) return Cmd(0, 0, "waiting for sensor")
+        val leftOn = code == 2 || code == 3     // left sensor sees "dark"
+        val rightOn = code == 1 || code == 3    // right sensor sees "dark"
 
-        // 1) Block ahead: slow down, and if very close turn away a bit
+        // Learn what "centered on the road" looks like: both sensors agree for ~0.4 s
+        if (leftOn == rightOn) {
+            agreeTicks++
+            if (agreeTicks >= 8) baseline = leftOn
+        } else {
+            agreeTicks = 0
+        }
+
+        val base = baseline
+        if (base == null) {
+            calibTicks++
+            if (calibTicks > 80) return Cmd(0, 0, "STOP: put the robot in the middle of the road and start again")
+            return Cmd(0, 0, "calibrating: keep robot centered")
+        }
+
+        // Obstacle ahead: slow down, and when very close turn away a bit
         if (avoidBlocks) {
-            val veryClose = d in 3..15
-            if (veryClose || (obstacleActive && d in 3..22)) {
+            val d = distanceCm
+            if (d in 3..15 || (obstacleActive && d in 3..22)) {
                 obstacleActive = true
                 obstacleTicks++
                 if (obstacleTicks > 60) return Cmd(0, 0, "STOP: blocked for 3 s")
-                // spin toward the side where the line was last seen (back toward the track)
-                return if (lastSide >= 0) Cmd(30, -30, "block ahead: turning right")
-                else Cmd(-30, 30, "block ahead: turning left")
+                return if (lastSteer >= 0) Cmd(30, -30, "obstacle: turning right")
+                else Cmd(-30, 30, "obstacle: turning left")
             }
         }
         obstacleActive = false
         obstacleTicks = 0
-        val slow = avoidBlocks && d in 3..30
+        val slow = avoidBlocks && distanceCm in 3..30
         val b = maxOf(25, (baseSpeed * (if (slow) 0.65f else 1f)).roundToInt())
 
-        // 2) Follow the line
-        val sameSide = code == prevCode
-        prevCode = code
-        val decision: Cmd = when (code) {
-            3 -> {
-                sameSideTicks = 0; lostTicks = 0
-                Cmd(b, b, if (thinLine) "crossing" else "on line")
-            }
-            2 -> {   // left sensor on line -> line is on the left -> turn left
-                lastSide = -1; lostTicks = 0
-                sameSideTicks = if (sameSide) sameSideTicks + 1 else 1
-                val inner = if (sameSideTicks > 6) -30 else 0   // pivot harder if it keeps drifting
-                Cmd(inner, b, "turn left")
-            }
-            1 -> {   // right sensor on line -> line is on the right -> turn right
-                lastSide = 1; lostTicks = 0
-                sameSideTicks = if (sameSide) sameSideTicks + 1 else 1
-                val inner = if (sameSideTicks > 6) -30 else 0
-                Cmd(b, inner, "turn right")
-            }
-            0 -> {
-                if (thinLine) {
-                    sameSideTicks = 0; lostTicks = 0
-                    Cmd(b, b, "centered")
-                } else {
-                    lostTicks++
-                    when {
-                        lostTicks < 6 -> lastDecision                       // brief gap: keep going
-                        lostTicks < 60 ->                                   // search toward last side
-                            if (lastSide >= 0) Cmd(30, -30, "line lost: searching right")
-                            else Cmd(-30, 30, "line lost: searching left")
-                        else -> Cmd(0, 0, "STOP: line lost")
-                    }
-                }
-            }
-            else -> Cmd(0, 0, "waiting for sensor")                        // no reply yet
+        // Which sensors differ from the "centered" reading?
+        val leftDiff = leftOn != base
+        val rightDiff = rightOn != base
+
+        if (leftDiff && rightDiff) {
+            bothTicks++
+            sideTicks = 0
+            // both changed: crossing a white line / checkered strip, keep straight for a moment
+            if (bothTicks > 40) return Cmd(0, 0, "STOP: off the road")
+            return Cmd(b, b, "crossing a line")
         }
-        lastDecision = decision
-        return decision
+        bothTicks = 0
+
+        if (leftDiff) {          // left sensor reached the border -> steer right
+            sideTicks = if (lastSteer == 1) sideTicks + 1 else 1
+            lastSteer = 1
+            val inner = if (sideTicks > 6) -30 else 0
+            return Cmd(b, inner, "near left edge: steering right")
+        }
+        if (rightDiff) {         // right sensor reached the border -> steer left
+            sideTicks = if (lastSteer == -1) sideTicks + 1 else 1
+            lastSteer = -1
+            val inner = if (sideTicks > 6) -30 else 0
+            return Cmd(inner, b, "near right edge: steering left")
+        }
+        sideTicks = 0
+        return Cmd(b, b, "centered")
     }
 
     private fun send(action: (BluetoothGatt) -> Unit) {
