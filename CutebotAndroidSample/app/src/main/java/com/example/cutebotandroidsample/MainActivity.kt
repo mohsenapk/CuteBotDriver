@@ -9,7 +9,6 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -30,17 +29,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
-import android.graphics.Color as AColor
-import android.util.Size
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
-import androidx.camera.lifecycle.ProcessCameraProvider
 import java.util.concurrent.Executors
-import kotlin.math.abs
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
@@ -48,20 +39,17 @@ class MainActivity : ComponentActivity() {
     private var activeGatt: BluetoothGatt? by mutableStateOf(null)
     private var connectionStatus by mutableStateOf("Disconnected")
 
-    // Purple line follower (uses the phone camera)
+    // Line follower using the robot's own sensors (line sensors + distance sensor)
     private var followStatus by mutableStateOf("Off")
     private var following by mutableStateOf(false)
-    private val follower = PurpleLineFollower({ activeGatt }) { msg ->
-        runOnUiThread { followStatus = msg }
-    }
-    private val cameraPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) startFollowing() else followStatus = "Camera permission denied"
-    }
+    private val follower = SensorLineFollower(
+        gattProvider = { activeGatt },
+        onStatus = { msg -> runOnUiThread { followStatus = msg } },
+        onFinished = { runOnUiThread { following = false } }
+    )
 
     private fun startFollowing() {
-        follower.start(this)
+        follower.start()
         following = true
     }
 
@@ -71,15 +59,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toggleFollow() {
-        if (following) {
-            stopFollowing()
-        } else if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            startFollowing()
-        } else {
-            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-        }
+        if (following) stopFollowing() else startFollowing()
     }
 
     override fun onDestroy() {
@@ -155,6 +135,7 @@ class MainActivity : ComponentActivity() {
 
         // Setup telemetry listener from CutebotController API
         CutebotController.onTelemetry = { telemetry ->
+            follower.onTelemetry(telemetry)
             runOnUiThread {
                 when (telemetry) {
                     is CutebotTelemetry.Distance -> telemetryDistance = "${telemetry.cm} cm"
@@ -208,7 +189,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun RobotControllerScreen() {
         var driveSpeed by remember { mutableFloatStateOf(60f) }
-        var avoidRed by remember { mutableStateOf(true) }
+        var avoidBlocks by remember { mutableStateOf(true) }
+        var thinLine by remember { mutableStateOf(false) }
         val isConnected = activeGatt != null
 
         Column(
@@ -268,12 +250,13 @@ class MainActivity : ComponentActivity() {
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Purple line follower
-            SectionHeader(title = "Purple Line Follower (phone camera)")
+            // Line follower (robot sensors)
+            SectionHeader(title = "Purple Line Follower (robot sensors)")
             Button(
                 onClick = {
                     follower.baseSpeed = driveSpeed.toInt()
-                    follower.avoidRed = avoidRed
+                    follower.avoidBlocks = avoidBlocks
+                    follower.thinLine = thinLine
                     toggleFollow()
                 },
                 enabled = isConnected,
@@ -284,17 +267,20 @@ class MainActivity : ComponentActivity() {
             ) { Text(if (following) "STOP following" else "Start following purple line") }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
-                    checked = avoidRed,
-                    onCheckedChange = { avoidRed = it; follower.avoidRed = it }
+                    checked = avoidBlocks,
+                    onCheckedChange = { avoidBlocks = it; follower.avoidBlocks = it }
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Avoid red blocks")
+                Text("Avoid blocks (distance sensor)")
             }
-            Button(
-                onClick = { follower.calibrateOnPurple() },
-                enabled = following,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("Calibrate (purple line at bottom-center)") }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = thinLine,
+                    onCheckedChange = { thinLine = it; follower.thinLine = it }
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Thin line (between the two sensors)")
+            }
             Text(followStatus)
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -523,259 +509,206 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
- * Real-time purple-line follower using the PHONE camera (the Cutebot itself has no camera).
- * Mount the phone on the robot, back camera looking forward/down at the floor.
+ * Line follower that uses the ROBOT's own sensors (no phone camera):
+ *  - bottom infrared line sensors (?LINE): 3 = both on line, 2 = left on line, 1 = right on line, 0 = none
+ *  - ultrasonic distance sensor (?DIST): used to slow down and turn away from blocks ahead
  *
- * Each frame: find purple pixels (HSV) in the lower part of the image, compute where the
- * line is (left/right), and send differential motor speeds (MS,left,right) over BLE.
- * White pixels (guardrail) on one side push the robot away from that side.
+ * Everything goes through one 50 ms loop that sends exactly one BLE command per tick
+ * (a motor command if it changed, otherwise a sensor query), so writes never collide.
  */
-class PurpleLineFollower(
+class SensorLineFollower(
     private val gattProvider: () -> BluetoothGatt?,
-    private val onStatus: (String) -> Unit = {}
-) : ImageAnalysis.Analyzer {
-
-    // ---- Tuning knobs (change these to adjust behaviour) ----
+    private val onStatus: (String) -> Unit = {},
+    private val onFinished: () -> Unit = {}
+) {
+    // ---- Tuning knobs ----
     @Volatile var baseSpeed = 40          // forward speed (motors stall below ~25)
-    @Volatile var steerGain = 40f         // how hard to turn toward the line
-    @Volatile var derivGain = 12f         // damping, reduces wobble
-    @Volatile var hueMin = 255f           // purple hue range in degrees (0..360)
-    @Volatile var hueMax = 305f
-    @Volatile var satMin = 0.25f          // min colour saturation (ignore grey/white)
-    @Volatile var valMin = 0.20f          // min brightness (ignore shadows)
-    @Volatile var avoidRed = true         // steer away from red obstacle blocks
-    @Volatile var avoidWhite = true       // push away from white guardrail; set false if floor is white
+    @Volatile var avoidBlocks = true      // slow down / turn away from blocks using the distance sensor
+    @Volatile var thinLine = false        // true if the line is thinner than the gap between the two sensors
 
-    @Volatile private var running = false
+    private data class Cmd(val left: Int, val right: Int, val note: String)
+
     private val lock = Any()
-    @Volatile private var calibrateNext = false
-    private var cameraProvider: ProcessCameraProvider? = null
-    private val executor = Executors.newSingleThreadExecutor()
+    @Volatile private var running = false
+    private var scheduler: ScheduledExecutorService? = null
+    private val handler = Handler(Looper.getMainLooper())
 
-    private var prevError = 0f
-    private var lastError = 0f
-    private var lostFrames = 0
-    private var lastSendMs = 0L
-    private val hsv = FloatArray(3)
+    // Latest sensor values (written by BLE thread, read by the loop)
+    @Volatile private var lineCode = -1
+    @Volatile private var distanceCm = -1
+    @Volatile private var lastReplyMs = 0L
 
-    /** Start camera + following. Camera permission must already be granted. */
-    fun start(activity: ComponentActivity) {
-        val future = ProcessCameraProvider.getInstance(activity)
-        future.addListener({
-            val provider = future.get()
-            cameraProvider = provider
-            val analysis = ImageAnalysis.Builder()
-                .setResolutionSelector(
-                    ResolutionSelector.Builder()
-                        .setResolutionStrategy(
-                            ResolutionStrategy(
-                                Size(320, 240),
-                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
-                            )
-                        )
-                        .build()
-                )
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-            analysis.setAnalyzer(executor, this)
-            provider.unbindAll()
-            provider.bindToLifecycle(activity, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
-            prevError = 0f
-            lastError = 0f
-            lostFrames = 0
+    // Loop state (only touched by the loop thread)
+    private var tickCount = 0
+    private var queryIndex = 0
+    private var lastSide = 1              // 1 = line last seen on the right, -1 = on the left
+    private var prevCode = -1
+    private var sameSideTicks = 0
+    private var lostTicks = 0
+    private var obstacleActive = false
+    private var obstacleTicks = 0
+    private var lastCmd: Cmd? = null
+    private var lastCmdMs = 0L
+    private var lastDecision = Cmd(0, 0, "")
+
+    /** Call from CutebotController.onTelemetry for every telemetry packet. */
+    fun onTelemetry(t: CutebotTelemetry) {
+        when (t) {
+            is CutebotTelemetry.LineTracker -> {
+                lineCode = t.code
+                lastReplyMs = System.currentTimeMillis()
+            }
+            is CutebotTelemetry.Distance -> distanceCm = t.cm
+            else -> {}
+        }
+    }
+
+    fun start() {
+        synchronized(lock) {
+            if (running) return
             running = true
-            onStatus("Following: looking for purple line")
-        }, ContextCompat.getMainExecutor(activity))
+        }
+        lineCode = -1
+        distanceCm = -1
+        lastReplyMs = System.currentTimeMillis()
+        tickCount = 0; queryIndex = 0; prevCode = -1; sameSideTicks = 0; lostTicks = 0
+        obstacleActive = false; obstacleTicks = 0; lastCmd = null; lastCmdMs = 0L
+        val s = Executors.newSingleThreadScheduledExecutor()
+        scheduler = s
+        s.scheduleWithFixedDelay({
+            try {
+                tick()
+            } catch (e: Exception) {
+                android.util.Log.e("LineFollower", "tick failed", e)
+            }
+        }, 0, 50, TimeUnit.MILLISECONDS)
+        onStatus("Following: reading sensors")
     }
 
     fun stop() {
-        // Under the lock so no in-flight camera frame can send a drive command after the stop
+        // Under the lock so the loop can never send a drive command after the stop
         synchronized(lock) {
             running = false
             gattProvider()?.let { CutebotController.stop(it) }
         }
+        scheduler?.shutdown()
+        scheduler = null
         // Repeat the stop in case a BLE write was busy and the first one was dropped
-        val handler = Handler(Looper.getMainLooper())
         handler.postDelayed({ if (!running) gattProvider()?.let { CutebotController.stop(it) } }, 120)
         handler.postDelayed({ if (!running) gattProvider()?.let { CutebotController.stop(it) } }, 300)
-        cameraProvider?.unbindAll()
         onStatus("Stopped")
     }
 
-    /** Learn the purple colour from the centre of the lower image area (put the line there first). */
-    fun calibrateOnPurple() {
-        calibrateNext = true
+    private fun haltItself(message: String) {
+        stop()
+        onStatus(message)
+        onFinished()
     }
 
-    override fun analyze(image: ImageProxy) {
-        try {
-            if (running) process(image)
-        } catch (e: Exception) {
-            android.util.Log.e("LineFollower", "analyze failed", e)
-        } finally {
-            image.close()
-        }
-    }
+    private fun tick() {
+        if (!running) return
+        tickCount++
+        val now = System.currentTimeMillis()
 
-    private fun process(image: ImageProxy) {
-        val w = image.width
-        val h = image.height
-        val rot = image.imageInfo.rotationDegrees
-        val sideways = rot == 90 || rot == 270
-        val rw = if (sideways) h else w   // upright image size
-        val rh = if (sideways) w else h
-        val plane = image.planes[0]
-        val buf = plane.buffer
-        val rowStride = plane.rowStride
-        val pixStride = plane.pixelStride
-
-        // Read pixel at upright coordinates (rx, ry) into hsv[]
-        fun readHsv(rx: Int, ry: Int) {
-            val sx: Int
-            val sy: Int
-            when (rot) {
-                90 -> { sx = ry; sy = h - 1 - rx }
-                180 -> { sx = w - 1 - rx; sy = h - 1 - ry }
-                270 -> { sx = w - 1 - ry; sy = rx }
-                else -> { sx = rx; sy = ry }
-            }
-            val i = sy * rowStride + sx * pixStride
-            val r = buf.get(i).toInt() and 0xFF
-            val g = buf.get(i + 1).toInt() and 0xFF
-            val b = buf.get(i + 2).toInt() and 0xFF
-            AColor.RGBToHSV(r, g, b, hsv)
-        }
-
-        val top = (rh * 0.45f).toInt()   // only look at the lower 55% (the floor ahead)
-
-        if (calibrateNext) {
-            calibrateNext = false
-            var hs = 0f; var ss = 0f; var vs = 0f; var n = 0
-            val cx = rw / 2
-            val cy = (top + rh) / 2
-            for (dy in -6..6 step 2) for (dx in -6..6 step 2) {
-                readHsv(cx + dx, cy + dy)
-                hs += hsv[0]; ss += hsv[1]; vs += hsv[2]; n++
-            }
-            val hAvg = hs / n
-            hueMin = hAvg - 25f
-            hueMax = hAvg + 25f
-            satMin = maxOf(0.15f, ss / n * 0.5f)
-            valMin = maxOf(0.10f, vs / n * 0.5f)
-            onStatus("Calibrated: hue ${hAvg.roundToInt()}")
-        }
-
-        var count = 0
-        var sumX = 0f
-        var wSum = 0f
-        var total = 0
-        var whiteL = 0
-        var whiteR = 0
-        var redCount = 0
-        var redSumX = 0f
-        val half = rw / 2
-        val hMin = hueMin; val hMax = hueMax; val sMin = satMin; val vMin = valMin
-
-        var y = top
-        while (y < rh) {
-            val rowWeight = 1f + (y - top).toFloat() / (rh - top)   // nearer rows count more
-            var x = 0
-            while (x < rw) {
-                readHsv(x, y)
-                total++
-                val hue = hsv[0]; val s = hsv[1]; val v = hsv[2]
-                if (hue in hMin..hMax && s >= sMin && v >= vMin) {
-                    count++
-                    sumX += x * rowWeight
-                    wSum += rowWeight
-                } else if ((hue < 15f || hue > 345f) && s > 0.50f && v > 0.30f) {
-                    redCount++                 // red obstacle block
-                    redSumX += x
-                } else if (s < 0.15f && v > 0.80f) {
-                    if (x < half) whiteL++ else whiteR++
-                }
-                x += 4
-            }
-            y += 4
-        }
-
-        val frac = if (total > 0) count.toFloat() / total else 0f
-        if (frac < 0.01f || wSum == 0f) {
-            handleLost()
+        // Watchdog: no sensor reply for 1.5 s (disconnected / robot not answering) -> stop
+        if (now - lastReplyMs > 1500) {
+            haltItself("No sensor data: stopped")
             return
         }
-        lostFrames = 0
 
-        // error: -1 (line far left) .. +1 (line far right)
-        val cxLine = sumX / wSum
-        var error = (cxLine - rw / 2f) / (rw / 2f)
-        if (avoidWhite && total > 0) {
-            val wl = whiteL / (total / 2f)
-            val wr = whiteR / (total / 2f)
-            if (wl > 0.35f) error += (wl - 0.35f)   // white on left -> steer right
-            if (wr > 0.35f) error -= (wr - 0.35f)   // white on right -> steer left
+        val cmd = decide()
+        if (cmd.left == 0 && cmd.right == 0 && cmd.note.startsWith("STOP")) {
+            haltItself(cmd.note)
+            return
         }
 
-        // Red blocks: turn a bit away from them and slow down
-        var speedFactor = 1f
-        if (avoidRed && total > 0 && redCount > 0.02f * total) {
-            val redFrac = redCount.toFloat() / total
-            val side = (redSumX / redCount - rw / 2f) / (rw / 2f)   // -1 left .. +1 right
-            val push = (redFrac * 10f).coerceIn(0.2f, 0.8f)         // bigger/closer block = stronger turn
-            error += if (side >= 0f) -push else push
-            speedFactor = 0.7f
-        }
-        error = error.coerceIn(-1f, 1f)
-
-        val d = error - prevError
-        prevError = error
-        lastError = error
-
-        val now = System.currentTimeMillis()
-        if (now - lastSendMs < 80) return        // throttle BLE to ~12 commands/sec
-        lastSendMs = now
-
-        val speed = baseSpeed * speedFactor * (1f - 0.4f * abs(error))   // slow down in sharp turns
-        val turn = steerGain * error + derivGain * d
-        send(speed + turn, speed - turn)          // line on right -> left wheel faster -> turn right
-        val redNote = if (speedFactor < 1f) "  RED block" else ""
-        onStatus("purple ${(frac * 100).roundToInt()}%  error ${"%.2f".format(error)}$redNote")
-    }
-
-    private fun handleLost() {
-        lostFrames++
-        if (lostFrames < 3) return                // ignore brief dropouts, keep last command
-        val now = System.currentTimeMillis()
-        if (now - lastSendMs < 80) return
-        lastSendMs = now
-        if (lostFrames < 40) {
-            val dir = if (lastError >= 0f) 1 else -1   // spin toward where the line was last seen
-            send(30f * dir, -30f * dir)
-            onStatus("Line lost: searching")
+        val changed = lastCmd == null || cmd.left != lastCmd!!.left || cmd.right != lastCmd!!.right
+        if (changed || now - lastCmdMs > 300) {
+            send { g -> CutebotController.setMotorSpeeds(g, cmd.left, cmd.right) }
+            lastCmd = cmd
+            lastCmdMs = now
         } else {
-            synchronized(lock) {
-                if (running) gattProvider()?.let { CutebotController.stop(it) }
+            // line queries twice for every distance query
+            val askDistance = avoidBlocks && (queryIndex % 3 == 2)
+            queryIndex++
+            send { g ->
+                if (askDistance) CutebotController.requestDistance(g)
+                else CutebotController.requestLineStatus(g)
             }
-            onStatus("Line lost: stopped")
+        }
+
+        if (tickCount % 5 == 0) {
+            onStatus("line=$lineCode  dist=${distanceCm}cm  ${cmd.note}")
         }
     }
 
-    private fun send(left: Float, right: Float) {
+    private fun decide(): Cmd {
+        val d = distanceCm
+        val code = lineCode
+
+        // 1) Block ahead: slow down, and if very close turn away a bit
+        if (avoidBlocks) {
+            val veryClose = d in 3..15
+            if (veryClose || (obstacleActive && d in 3..22)) {
+                obstacleActive = true
+                obstacleTicks++
+                if (obstacleTicks > 60) return Cmd(0, 0, "STOP: blocked for 3 s")
+                // spin toward the side where the line was last seen (back toward the track)
+                return if (lastSide >= 0) Cmd(30, -30, "block ahead: turning right")
+                else Cmd(-30, 30, "block ahead: turning left")
+            }
+        }
+        obstacleActive = false
+        obstacleTicks = 0
+        val slow = avoidBlocks && d in 3..30
+        val b = maxOf(25, (baseSpeed * (if (slow) 0.65f else 1f)).roundToInt())
+
+        // 2) Follow the line
+        val sameSide = code == prevCode
+        prevCode = code
+        val decision: Cmd = when (code) {
+            3 -> {
+                sameSideTicks = 0; lostTicks = 0
+                Cmd(b, b, if (thinLine) "crossing" else "on line")
+            }
+            2 -> {   // left sensor on line -> line is on the left -> turn left
+                lastSide = -1; lostTicks = 0
+                sameSideTicks = if (sameSide) sameSideTicks + 1 else 1
+                val inner = if (sameSideTicks > 6) -30 else 0   // pivot harder if it keeps drifting
+                Cmd(inner, b, "turn left")
+            }
+            1 -> {   // right sensor on line -> line is on the right -> turn right
+                lastSide = 1; lostTicks = 0
+                sameSideTicks = if (sameSide) sameSideTicks + 1 else 1
+                val inner = if (sameSideTicks > 6) -30 else 0
+                Cmd(b, inner, "turn right")
+            }
+            0 -> {
+                if (thinLine) {
+                    sameSideTicks = 0; lostTicks = 0
+                    Cmd(b, b, "centered")
+                } else {
+                    lostTicks++
+                    when {
+                        lostTicks < 6 -> lastDecision                       // brief gap: keep going
+                        lostTicks < 60 ->                                   // search toward last side
+                            if (lastSide >= 0) Cmd(30, -30, "line lost: searching right")
+                            else Cmd(-30, 30, "line lost: searching left")
+                        else -> Cmd(0, 0, "STOP: line lost")
+                    }
+                }
+            }
+            else -> Cmd(0, 0, "waiting for sensor")                        // no reply yet
+        }
+        lastDecision = decision
+        return decision
+    }
+
+    private fun send(action: (BluetoothGatt) -> Unit) {
         synchronized(lock) {
             if (!running) return
             val g = gattProvider() ?: return
-            CutebotController.setMotorSpeeds(g, deadband(left), deadband(right))
-        }
-    }
-
-    // Motors whine without moving below ~25, so jump over that dead zone.
-    private fun deadband(v: Float): Int {
-        val i = v.roundToInt().coerceIn(-100, 100)
-        return when {
-            i in 1..24 -> 25
-            i in -24..-1 -> -25
-            else -> i
+            action(g)
         }
     }
 }
