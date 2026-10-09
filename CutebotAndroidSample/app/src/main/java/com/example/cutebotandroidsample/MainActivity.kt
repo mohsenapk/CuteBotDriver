@@ -12,6 +12,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -484,7 +486,7 @@ class MainActivity : ComponentActivity() {
     fun GridControls(speed: Int) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Button(
-                onClick = { activeGatt?.let { CutebotController.moveForward(it, speed) } },
+                onClick = { if (following) stopFollowing(); activeGatt?.let { CutebotController.moveForward(it, speed) } },
                 modifier = Modifier.size(76.dp)
             ) { Text("W") }
 
@@ -493,24 +495,27 @@ class MainActivity : ComponentActivity() {
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Button(
-                    onClick = { activeGatt?.let { CutebotController.turnLeft(it, speed) } },
+                    onClick = { if (following) stopFollowing(); activeGatt?.let { CutebotController.turnLeft(it, speed) } },
                     modifier = Modifier.size(76.dp)
                 ) { Text("A") }
 
                 Button(
-                    onClick = { activeGatt?.let { CutebotController.stop(it) } },
+                    onClick = {
+                        if (following) stopFollowing()
+                        activeGatt?.let { CutebotController.stop(it) }
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = Color.Red),
                     modifier = Modifier.size(76.dp)
                 ) { Text("STOP") }
 
                 Button(
-                    onClick = { activeGatt?.let { CutebotController.turnRight(it, speed) } },
+                    onClick = { if (following) stopFollowing(); activeGatt?.let { CutebotController.turnRight(it, speed) } },
                     modifier = Modifier.size(76.dp)
                 ) { Text("D") }
             }
 
             Button(
-                onClick = { activeGatt?.let { CutebotController.moveBackward(it, speed) } },
+                onClick = { if (following) stopFollowing(); activeGatt?.let { CutebotController.moveBackward(it, speed) } },
                 modifier = Modifier.size(76.dp)
             ) { Text("S") }
         }
@@ -542,6 +547,7 @@ class PurpleLineFollower(
     @Volatile var avoidWhite = true       // push away from white guardrail; set false if floor is white
 
     @Volatile private var running = false
+    private val lock = Any()
     @Volatile private var calibrateNext = false
     private var cameraProvider: ProcessCameraProvider? = null
     private val executor = Executors.newSingleThreadExecutor()
@@ -584,8 +590,15 @@ class PurpleLineFollower(
     }
 
     fun stop() {
-        running = false
-        gattProvider()?.let { CutebotController.stop(it) }
+        // Under the lock so no in-flight camera frame can send a drive command after the stop
+        synchronized(lock) {
+            running = false
+            gattProvider()?.let { CutebotController.stop(it) }
+        }
+        // Repeat the stop in case a BLE write was busy and the first one was dropped
+        val handler = Handler(Looper.getMainLooper())
+        handler.postDelayed({ if (!running) gattProvider()?.let { CutebotController.stop(it) } }, 120)
+        handler.postDelayed({ if (!running) gattProvider()?.let { CutebotController.stop(it) } }, 300)
         cameraProvider?.unbindAll()
         onStatus("Stopped")
     }
@@ -741,14 +754,19 @@ class PurpleLineFollower(
             send(30f * dir, -30f * dir)
             onStatus("Line lost: searching")
         } else {
-            gattProvider()?.let { CutebotController.stop(it) }
+            synchronized(lock) {
+                if (running) gattProvider()?.let { CutebotController.stop(it) }
+            }
             onStatus("Line lost: stopped")
         }
     }
 
     private fun send(left: Float, right: Float) {
-        val g = gattProvider() ?: return
-        CutebotController.setMotorSpeeds(g, deadband(left), deadband(right))
+        synchronized(lock) {
+            if (!running) return
+            val g = gattProvider() ?: return
+            CutebotController.setMotorSpeeds(g, deadband(left), deadband(right))
+        }
     }
 
     // Motors whine without moving below ~25, so jump over that dead zone.
