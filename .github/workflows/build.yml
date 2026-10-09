@@ -9,6 +9,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      - name: Add camera permission and libraries
+        working-directory: CutebotAndroidSample
+        run: |
+          grep -q 'permission.CAMERA' app/src/main/AndroidManifest.xml || sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA" />\n    <application|' app/src/main/AndroidManifest.xml
+          grep -q 'camera-core' app/build.gradle.kts || sed -i 's|    testImplementation(libs.junit)|    implementation("androidx.camera:camera-core:1.4.2")\n    implementation("androidx.camera:camera-camera2:1.4.2")\n    implementation("androidx.camera:camera-lifecycle:1.4.2")\n    testImplementation(libs.junit)|' app/build.gradle.kts
       - name: Build
         working-directory: CutebotAndroidSample
         run: |
